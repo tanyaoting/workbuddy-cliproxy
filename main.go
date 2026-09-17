@@ -327,6 +327,8 @@ func wbModels() []pluginapi.ModelInfo {
 		{"hy3-preview-agent", "Hy3 Preview Agent", 262144},
 		{"deepseek-v4-pro", "DeepSeek V4 Pro", 1000000},
 		{"deepseek-v4-flash", "DeepSeek V4 Flash", 1000000},
+		// [workbuddy 2026-09-15] 新增 deepseek-v4.1-flash 模型
+		{"deepseek-v4.1-flash", "DeepSeek V4.1 Flash", 1000000},
 	}
 	models := make([]pluginapi.ModelInfo, 0, len(specs))
 	for _, m := range specs {
