@@ -22,10 +22,11 @@ GO_IMAGE="${GO_IMAGE:-golang:1.26-bookworm}"
 SKIP_VERIFY="${SKIP_VERIFY:-0}"
 CPA_URL="${CPA_URL:-http://localhost:8317}"
 CPA_KEY="${CPA_KEY:-}"
-MODEL_TO_TEST="${MODEL_TO_TEST:-deepseek-v4.1-flash}"
 # Go 缓存 volume 名(按架构加后缀;设为空字符串可退回「不缓存」)
 GOPATH_VOL_BASE="${GOPATH_VOL_BASE:-workbuddy-gopath}"
 GOCACHE_VOL_BASE="${GOCACHE_VOL_BASE:-workbuddy-gocache}"
+# dist/.backup/ 保留的产物份数(0 = 不保留,即关闭备份)
+KEEP_BACKUPS="${KEEP_BACKUPS:-5}"
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # 产物落到 dist/,不覆盖仓库里已有的 workbuddy.so(.dylib 等历史产物)
@@ -137,7 +138,32 @@ if [ -n "$(git -C "$SRC_DIR" status --porcelain 2>/dev/null)" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 1. 容器内编译
+# 1. 备份上次的 dist 产物(编译会覆盖它)
+# ---------------------------------------------------------------------------
+# 备份放 dist/.backup/ 下(带点,和产物分层),目录不存在或没有旧产物就跳过。
+# 只保留最近 KEEP_BACKUPS 份,避免长期堆积。
+if [ -f "$OUT_SO" ]; then
+  if [ "$KEEP_BACKUPS" -gt 0 ] 2>/dev/null; then
+    log "备份上次产物"
+    BACKUP_SUBDIR="$DIST_DIR/.backup"
+    mkdir -p "$BACKUP_SUBDIR"
+    STAMP="$(date +%Y%m%d-%H%M%S)"
+    OLD_DIST_SHA="$(shasum -a 256 "$OUT_SO" | awk '{print $1}')"
+    cp "$OUT_SO" "$BACKUP_SUBDIR/workbuddy.so.$STAMP"
+    ok "备份到 dist/.backup/workbuddy.so.$STAMP(sha256 ${OLD_DIST_SHA:0:16}…)"
+    # 只保留最近 N 份
+    ls -1t "$BACKUP_SUBDIR"/workbuddy.so.* 2>/dev/null \
+      | tail -n +$((KEEP_BACKUPS + 1)) \
+      | while read -r f; do rm -f "$f"; done
+  else
+    warn "KEEP_BACKUPS=$KEEP_BACKUPS,跳过备份"
+  fi
+else
+  warn "dist/ 下没有旧产物,跳过备份"
+fi
+
+# ---------------------------------------------------------------------------
+# 2. 容器内编译
 # ---------------------------------------------------------------------------
 log "编译中(容器 $GO_IMAGE,目标 linux/$GOARCH_VAL)"
 
@@ -169,7 +195,7 @@ BUILD_SEC=$(( $(date +%s) - BUILD_START ))
 ok "编译完成,耗时 ${BUILD_SEC}s"
 
 # ---------------------------------------------------------------------------
-# 2. 校验产物
+# 3. 校验产物
 # ---------------------------------------------------------------------------
 log "校验产物"
 
@@ -200,7 +226,7 @@ SO_SHA="$(shasum -a 256 "$OUT_SO" | awk '{print $1}')"
 ok "大小 $SO_SIZE,sha256 ${SO_SHA:0:16}…"
 
 # ---------------------------------------------------------------------------
-# 3. 拷贝新插件
+# 4. 拷贝新插件
 # ---------------------------------------------------------------------------
 log "部署到容器"
 
@@ -240,7 +266,7 @@ if docker logs --since 90s "$CONTAINER" 2>&1 | grep -q "model registrar workbudd
 fi
 
 # ---------------------------------------------------------------------------
-# 4. 端到端验证
+# 5. 端到端验证
 # ---------------------------------------------------------------------------
 if [ "$SKIP_VERIFY" = "1" ]; then
   warn "SKIP_VERIFY=1,跳过 API 验证"
@@ -248,13 +274,19 @@ else
   log "验证模型列表"
 
   if [ -z "$CPA_KEY" ]; then
-    # 从容器内 config.yaml 读第一个 api-key。两种写法都要认:
-    #   api-keys: ["xxx"]        (内联)
-    #   api-keys:                (块列表,取下一行的 - "xxx")
+    # 从容器内 config.yaml 读第一个 api-key。要认三种写法:
+    #   api-keys: ["xxx"]           (内联,顶层)
+    #   api-keys:                   (块列表,取紧随的 - "xxx")
     #     - "xxx"
+    #   access:                     (CPA v8 把 key 挪进了 access 段)
+    #     api-keys:
+    #       - "xxx"
+    # 所以不能锚定行首:用 grep -E '^[[:space:]]*api-keys:' 匹配任意缩进层级,
+    # 再往后扫若干行取第一个带引号的值(块列表的项在下一行)。
     CPA_KEY="$(docker exec "$CONTAINER" sh -c \
-      "grep -A1 '^api-keys:' '$CONFIG_PATH' 2>/dev/null | grep -oE '\"[^\"]+\"' | head -1 | tr -d '\"'" || true)"
-    # 校验:真 key 是长随机串,不含冒号/空格;匹配失败时 grep 会把 'api-keys:' 原样带出来
+      "grep -A5 -E '^[[:space:]]*api-keys:' '$CONFIG_PATH' 2>/dev/null \
+         | grep -oE '\"[^\"]+\"' | head -1 | tr -d '\"'" || true)"
+    # 校验:真 key 是长随机串,不含冒号/空格
     case "$CPA_KEY" in
       ""|*:*|*\ *) CPA_KEY="" ;;
     esac
@@ -272,11 +304,6 @@ else
     else
       COUNT="$(printf '%s\n' "$MODELS" | grep -c . || true)"
       ok "模型列表 $COUNT 个"
-      if printf '%s\n' "$MODELS" | grep -qx "$MODEL_TO_TEST"; then
-        ok "目标模型 $MODEL_TO_TEST 在列"
-      else
-        warn "$MODEL_TO_TEST 不在模型列表里"
-      fi
     fi
   fi
 fi

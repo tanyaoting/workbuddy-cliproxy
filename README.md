@@ -84,10 +84,26 @@ strings workbuddy.so | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1   # glibc �
 
 1. **前置检查**:docker 可用、目标容器在跑、编译镜像存在;自动探测容器架构(决定 `GOARCH`)与 glibc 版本
 2. **探测布局**:找到 CPA 工作目录,决定插件该拷到哪
-3. **编译**:容器内 `go build -buildmode=c-shared`,不污染宿主机
-4. **校验**:架构、导出符号(必须 4 个)、**产物 glibc 下限 ≤ 容器 glibc**、打印 sha256
-5. **部署**:`docker cp` + 重启容器
-6. **验证**:轮询等 `plugin registered` 日志,再查 `/v1/models` 确认模型在列
+3. **备份**:上次的 `dist/workbuddy.so` 存到 `dist/.backup/`(没有就跳过)
+4. **编译**:容器内 `go build -buildmode=c-shared`,不污染宿主机
+5. **校验**:架构、导出符号(必须 4 个)、**产物 glibc 下限 ≤ 容器 glibc**、打印 sha256
+6. **部署**:`docker cp` + 重启容器
+7. **验证**:轮询等 `plugin registered` 日志,再查 `/v1/models` 确认模型在列
+
+### 产物备份
+
+编译会覆盖 `dist/workbuddy.so`,所以脚本先把它按时间戳存到 `dist/.backup/`,默认保留最近
+5 份(`KEEP_BACKUPS` 可调,设 `0` 关闭)。首次构建或备份目录为空时跳过这一步。
+
+```bash
+ls dist/.backup/
+# workbuddy.so.20261006-035900  workbuddy.so.20261006-035839  ...
+```
+
+`dist/` 整个在 `.gitignore` 里,备份不会被提交。回滚就是把某份拷回并重新部署。
+
+> 脚本**不备份容器内的插件** —— 因为 `plugins/` 通常是 bind mount,文件本来就存在宿主机上,
+> 且容器重建不丢。见下面「工作目录自动探测」。
 
 ### 工作目录自动探测
 
@@ -122,9 +138,9 @@ strings workbuddy.so | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1   # glibc �
 | `GOPROXY` | `https://goproxy.cn,direct` | 模块代理 |
 | `GOPATH_VOL_BASE` | `workbuddy-gopath` | Go 模块缓存 volume 名(自动加架构后缀) |
 | `GOCACHE_VOL_BASE` | `workbuddy-gocache` | Go 编译缓存 volume 名(自动加架构后缀) |
+| `KEEP_BACKUPS` | `5` | `dist/.backup/` 保留份数,`0` 关闭备份 |
 | `CPA_URL` | `http://localhost:8317` | 验证用地址 |
 | `CPA_KEY` | 从容器 config.yaml 读 | API key |
-| `MODEL_TO_TEST` | `deepseek-v4.1-flash` | 验证时检查的模型 |
 | `SKIP_VERIFY` | `0` | 设为 `1` 跳过 API 验证 |
 
 `GOARCH` 不用手填:脚本读容器 `uname -m` 自动决定,`aarch64`/`arm64` → `arm64`,
@@ -138,7 +154,9 @@ Go 的模块缓存与编译缓存挂在宿主机 volume(`workbuddy-gopath-<arch>
 docker volume rm workbuddy-gopath-arm64 workbuddy-gocache-arm64
 ```
 
-脚本不自动备份旧插件。要留退路,部署前自己拷一份即可(路径按上面探测结果替换):
+脚本备份的是**编译产物**(`dist/.backup/`),不备份容器内已部署的插件 —— 因为 `plugins/`
+通常是 bind mount,那份文件就是宿主机上的 `~/.cli-proxy-api/plugins/workbuddy.so`,
+容器重建也不丢。要额外留一份部署前的快照,自己拷:
 
 ```bash
 cp ~/.cli-proxy-api/plugins/workbuddy.so ~/.cli-proxy-api/plugins/workbuddy.so.bak
