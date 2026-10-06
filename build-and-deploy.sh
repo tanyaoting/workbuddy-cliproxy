@@ -4,7 +4,9 @@
 #
 #   ./build-and-deploy.sh
 #
-# 流程:容器内编译 -> 校验产物 -> 探测容器布局 -> 拷贝 -> 重启容器 -> 验证模型列表
+# 流程:备份产物 -> 容器内编译 -> 校验产物 -> 探测容器布局 -> 拷贝 -> 重启容器 -> 验证模型列表
+#
+# 插件名/产物名/GOPATH 等都可被环境变量覆盖,便于接到其他 CPA 插件仓库(见 PLUGIN_ID)。
 #
 # [workbuddy 2026-09-18] 首次编写:封装交叉编译 + 部署流程
 #
@@ -14,26 +16,33 @@ set -euo pipefail
 # 配置(按需改这里,或临时用环境变量覆盖)
 # ---------------------------------------------------------------------------
 CONTAINER="${CONTAINER:-cpa}"
+# 插件标识:决定产物名(dist/<id>.so)、容器内文件名、日志匹配、以及注册日志里的 plugin_id
+PLUGIN_ID="${PLUGIN_ID:-workbuddy}"
 # 插件路径相对于 CPA 工作目录;工作目录由脚本探测(见「探测容器布局」)
-PLUGIN_REL="${PLUGIN_REL:-plugins/workbuddy.so}"
+PLUGIN_REL="${PLUGIN_REL:-plugins/${PLUGIN_ID}.so}"
 # 手动覆盖工作目录(留空则自动探测 /CLIProxyAPI、/app 等)
 APP_DIR_OVERRIDE="${APP_DIR_OVERRIDE:-}"
 GO_IMAGE="${GO_IMAGE:-golang:1.26-bookworm}"
 SKIP_VERIFY="${SKIP_VERIFY:-0}"
 CPA_URL="${CPA_URL:-http://localhost:8317}"
 CPA_KEY="${CPA_KEY:-}"
-# Go 缓存 volume 名(按架构加后缀;设为空字符串可退回「不缓存」)
-GOPATH_VOL_BASE="${GOPATH_VOL_BASE:-workbuddy-gopath}"
-GOCACHE_VOL_BASE="${GOCACHE_VOL_BASE:-workbuddy-gocache}"
+# Go 缓存 volume 名(按架构加后缀)。默认按插件名分开,避免不同项目互相污染缓存
+GOPATH_VOL_BASE="${GOPATH_VOL_BASE:-${PLUGIN_ID}-gopath}"
+GOCACHE_VOL_BASE="${GOCACHE_VOL_BASE:-${PLUGIN_ID}-gocache}"
 # dist/.backup/ 保留的产物份数(0 = 不保留,即关闭备份)
 KEEP_BACKUPS="${KEEP_BACKUPS:-5}"
+# 额外的 go build 参数。两个独立变量,避免在环境变量里表达带空格的参数:
+#   GO_BUILD_FLAGS="-trimpath"          额外的开关(空格分隔的多个 flag)
+#   GO_LDFLAGS="-s -w"                  传给 -ldflags 的值(可含空格)
+GO_BUILD_FLAGS="${GO_BUILD_FLAGS:-}"
+GO_LDFLAGS="${GO_LDFLAGS:-}"
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# 产物落到 dist/,不覆盖仓库里已有的 workbuddy.so(.dylib 等历史产物)
+# 产物落到 dist/,不覆盖仓库里已有的历史产物(.so/.dylib 等)
 DIST_DIR="$SRC_DIR/dist"
 mkdir -p "$DIST_DIR"
 # 容器内输出用相对路径:必须相对于 /src,传宿主机绝对路径会写进容器临时层然后随 --rm 丢失
-OUT_REL="dist/workbuddy.so"
+OUT_REL="dist/${PLUGIN_ID}.so"
 OUT_SO="$SRC_DIR/$OUT_REL"
 
 # ---------------------------------------------------------------------------
@@ -149,10 +158,10 @@ if [ -f "$OUT_SO" ]; then
     mkdir -p "$BACKUP_SUBDIR"
     STAMP="$(date +%Y%m%d-%H%M%S)"
     OLD_DIST_SHA="$(shasum -a 256 "$OUT_SO" | awk '{print $1}')"
-    cp "$OUT_SO" "$BACKUP_SUBDIR/workbuddy.so.$STAMP"
-    ok "备份到 dist/.backup/workbuddy.so.$STAMP(sha256 ${OLD_DIST_SHA:0:16}…)"
+    cp "$OUT_SO" "$BACKUP_SUBDIR/${PLUGIN_ID}.so.$STAMP"
+    ok "备份到 dist/.backup/${PLUGIN_ID}.so.$STAMP(sha256 ${OLD_DIST_SHA:0:16}…)"
     # 只保留最近 N 份
-    ls -1t "$BACKUP_SUBDIR"/workbuddy.so.* 2>/dev/null \
+    ls -1t "$BACKUP_SUBDIR"/${PLUGIN_ID}.so.* 2>/dev/null \
       | tail -n +$((KEEP_BACKUPS + 1)) \
       | while read -r f; do rm -f "$f"; done
   else
@@ -188,7 +197,7 @@ docker run --rm --platform "linux/$GOARCH_VAL" \
   -e GOPATH=/tmp/gopath -e GOCACHE=/tmp/gocache \
   -e GOPROXY="${GOPROXY:-https://goproxy.cn,direct}" \
   "$GO_IMAGE" \
-  go build -buildmode=c-shared -o "$OUT_REL" . \
+  go build -buildmode=c-shared $GO_BUILD_FLAGS ${GO_LDFLAGS:+-ldflags="$GO_LDFLAGS"} -o "$OUT_REL" . \
   || die "编译失败"
 
 BUILD_SEC=$(( $(date +%s) - BUILD_START ))
@@ -246,7 +255,7 @@ ok "容器已重启,等待插件加载"
 LOADED=0
 for _ in $(seq 1 30); do
   sleep 2
-  if docker logs --since 90s "$CONTAINER" 2>&1 | grep -q "plugin registered plugin_id=workbuddy"; then
+  if docker logs --since 90s "$CONTAINER" 2>&1 | grep -q "plugin registered plugin_id=${PLUGIN_ID}"; then
     LOADED=1
     break
   fi
@@ -261,7 +270,7 @@ else
 fi
 
 # 注册过程中偶发 deadline 警告(旧版也有),提示但不视为失败
-if docker logs --since 90s "$CONTAINER" 2>&1 | grep -q "model registrar workbuddy failed"; then
+if docker logs --since 90s "$CONTAINER" 2>&1 | grep -q "model registrar ${PLUGIN_ID} failed"; then
   warn "日志有 'model registrar ... context deadline exceeded'(该插件既有现象,通常随后重试成功)"
 fi
 
