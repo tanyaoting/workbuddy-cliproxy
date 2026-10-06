@@ -10,13 +10,20 @@
 
 ## 模型
 
-`glm-5.2` · `glm-5.1` · `glm-5v-turbo` · `kimi-k2.7` · `minimax-m3-pay` · `hy3` · `hy3-preview` · `hy3-preview-agent` · `deepseek-v4-pro` · `deepseek-v4-flash` · `deepseek-v4.1-flash`
+模型清单从 CodeBuddy 控制面 `GET /v3/config` **动态获取**(官方客户端自己读的接口),
+服务端上新模型后无需改代码即可生效,30 分钟刷新一次。当前账号实测可见 30 个,包括
+`glm-5.3` · `glm-5.1` · `glm-5v-turbo` · `kimi-k3-1` · `minimax-m3` · `hy3` · `hy4-preview` ·
+`space-bunny` · `deepseek-v4-pro` · `deepseek-v4.1-flash` 等。
 
-具体可用性以 CodeBuddy 账号权限为准。
+拉取失败时退回内置兜底表。具体可用性以 CodeBuddy 账号权限为准。
+
+> 实现细节、模型来源考证、以及为什么不能用客户端打包的 `product.json` 当来源,见
+> [CLAUDE.md](CLAUDE.md) 第 4 节。
 
 ## 安装
 
-**前置**:运行中的 CLIProxyAPI v7.2.x(带 CGO / 插件支持)、CodeBuddy 账号、Go 1.26+ 与 gcc;编译架构需与 CPA 实例一致(amd64 / arm64)。
+**前置**:运行中的 CLIProxyAPI v7.2.x 或 v8.x(带 CGO / 插件支持;两代插件 ABI 均为 `1`,
+互相兼容)、CodeBuddy 账号、Go 1.26+ 与 gcc;编译架构需与 CPA 实例一致(amd64 / arm64)。
 
 ```bash
 git clone https://github.com/lovingfish/workbuddy-cliproxy.git
