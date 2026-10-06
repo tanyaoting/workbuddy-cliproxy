@@ -65,6 +65,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/cookiejar"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -106,6 +107,12 @@ var (
 )
 
 func main() {}
+
+// warnf writes a diagnostic to stderr, which the CPA host captures in its own
+// log stream. Used for non-fatal degradation (catalog refresh failing, etc.).
+func warnf(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "workbuddy: "+format+"\n", args...)
+}
 
 // -----------------------------------------------------------------------------
 // C ABI exports
@@ -228,8 +235,12 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 	switch method {
 	case pluginabi.MethodPluginRegister, pluginabi.MethodPluginReconfigure:
 		return okEnvelope(wbRegistration())
-	case pluginabi.MethodModelStatic, pluginabi.MethodModelForAuth:
-		return okEnvelope(pluginapi.ModelResponse{Provider: providerName, Models: wbModels()})
+	case pluginabi.MethodModelStatic:
+		// No auth attached: serve the last-known catalog (possibly empty on a
+		// cold start — model.for_auth follows once a credential exists).
+		return okEnvelope(pluginapi.ModelResponse{Provider: providerName, Models: wbModelsCached()})
+	case pluginabi.MethodModelForAuth:
+		return handleModelsForAuth(request)
 	case pluginabi.MethodAuthIdentifier:
 		return okEnvelope(identifierResponse{Identifier: providerName})
 	case pluginabi.MethodAuthParse:
@@ -310,41 +321,235 @@ func wbRegistration() registration {
 	}
 }
 
-func wbModels() []pluginapi.ModelInfo {
-	const maxCompletionTokens int64 = 8192
-	specs := []struct {
-		id            string
-		name          string
-		contextLength int64
-	}{
-		{"glm-5.2", "GLM-5.2", 1000000},
-		{"glm-5.1", "GLM-5.1", 131072},
-		{"glm-5v-turbo", "GLM-5V Turbo", 131072},
-		{"kimi-k2.7", "Kimi K2.7", 262144},
-		{"minimax-m3-pay", "MiniMax M3", 204800},
-		{"hy3", "Hy3", 262144},
-		{"hy3-preview", "Hy3 Preview", 262144},
-		{"hy3-preview-agent", "Hy3 Preview Agent", 262144},
-		{"deepseek-v4-pro", "DeepSeek V4 Pro", 1000000},
-		{"deepseek-v4-flash", "DeepSeek V4 Flash", 1000000},
-		// [workbuddy 2026-09-15] 新增 deepseek-v4.1-flash 模型
-		{"deepseek-v4.1-flash", "DeepSeek V4.1 Flash", 1000000},
+// modelCatalog is the upstream model list, discovered from the CodeBuddy
+// control-plane endpoint GET /v3/config.
+//
+// That endpoint is the authoritative source: it is what the official client
+// itself reads (its env override ACC_PRODUCT_CONFIG_V3/V2 injects the same
+// payload), it is returned per-credential, and it tracks server-side changes
+// automatically — models added after a client release still show up, which the
+// bundled product.json cannot do. The desktop app's product.json is only a
+// build-time fallback and was measured stale: it listed 49 ids of which ~half
+// were unreachable, while omitting server-only ids such as deepseek-v4.1-flash,
+// hy4-preview, glm-5.3 and space-bunny that /v3/config reports.
+//
+// Fallback ladder when the endpoint is unavailable: last successful response
+// (process cache) -> the built-in seed table below.
+const (
+	endpointConfig = upstreamBase + "/v3/config"
+	// catalogTTL bounds how stale a cached catalog may be.
+	catalogTTL = 30 * time.Minute
+	// catalogTimeout keeps discovery off the critical path of a login.
+	catalogTimeout = 15 * time.Second
+)
+
+var (
+	catalogMu      sync.Mutex
+	catalogCache   []pluginapi.ModelInfo
+	catalogFetched time.Time
+)
+
+// remoteModel mirrors one entry of the /v3/config `models` array. Only the
+// fields the plugin forwards to CPA are decoded; the endpoint also returns
+// credits, relatedModels, temperature and reasoning hints, which are not part
+// of CPA's ModelInfo.
+type remoteModel struct {
+	ID               string `json:"id"`
+	Name             string `json:"name"`
+	MaxInputTokens   int64  `json:"maxInputTokens"`
+	MaxOutputTokens  int64  `json:"maxOutputTokens"`
+	SupportsImages   bool   `json:"supportsImages"`
+	SupportsToolCall bool   `json:"supportsToolCall"`
+}
+
+type remoteConfig struct {
+	Code int    `json:"code"`
+	Msg  string `json:"msg"`
+	Data struct {
+		Models []remoteModel `json:"models"`
+	} `json:"data"`
+}
+
+// seedModels is the built-in fallback, used only when /v3/config cannot be
+// reached (offline, endpoint change, no credential yet). Kept deliberately
+// small — the remote catalog is the intended source of truth. Context and
+// output limits below were read from /v3/config on 2026-10-06; ids were also
+// confirmed reachable via /v2/chat/completions.
+func seedModels() []remoteModel {
+	return []remoteModel{
+		{"deepseek-v4-pro", "DeepSeek V4 Pro", 1000000, 128000, true, true},
+		{"deepseek-v4-flash", "DeepSeek V4 Flash", 1000000, 50000, true, true},
+		{"deepseek-v4.1-flash", "DeepSeek V4.1 Flash", 1000000, 128000, true, true},
+		{"deepseek-v3-2-volc", "DeepSeek V3.2", 96000, 32000, false, true},
+		{"glm-5.3", "GLM-5.3", 1000000, 64000, true, true},
+		{"glm-5.3-flash", "GLM-5.3 Flash", 1000000, 131072, true, true},
+		{"glm-5.2", "GLM-5.2", 1000000, 64000, true, true},
+		{"glm-5.1", "GLM-5.1", 200000, 48000, true, true},
+		{"glm-5.0-turbo", "GLM-5.0 Turbo", 200000, 48000, false, true},
+		{"glm-5v-turbo", "GLM-5v-Turbo", 200000, 64000, true, true},
+		{"kimi-k3-1", "Kimi K3", 1000000, 32000, true, true},
+		{"kimi-k2.8-preview", "Kimi K2.8 Preview", 1000000, 64000, true, true},
+		{"kimi-k2.7", "Kimi K2.7 Code", 256000, 32000, true, true},
+		{"kimi-k2.6", "Kimi K2.6", 256000, 32000, true, true},
+		{"kimi-k2.5", "Kimi K2.5", 164000, 32000, true, true},
+		{"minimax-m3", "MiniMax M3", 512000, 64000, true, true},
+		{"minimax-m2.7", "MiniMax M2.7", 200000, 48000, true, true},
+		{"hy4-preview", "Hy4 Preview", 960000, 64000, true, true},
+		{"hy3", "Hy3", 192000, 64000, true, true},
+		{"hy3-x", "Hy3 X", 192000, 64000, true, true},
+		{"space-bunny", "Space Bunny", 1000000, 128000, true, true},
+		{"hunyuan-chat", "Hunyuan Turbos", 200000, 8192, false, true},
+		{"default", "Default", 200000, 24000, false, true},
 	}
-	models := make([]pluginapi.ModelInfo, 0, len(specs))
-	for _, m := range specs {
-		models = append(models, pluginapi.ModelInfo{
-			ID:                         m.id,
-			Object:                     "model",
-			OwnedBy:                    providerName,
-			DisplayName:                m.name,
-			Name:                       m.id,
-			SupportedGenerationMethods: []string{"chat"},
-			ContextLength:              m.contextLength,
-			MaxCompletionTokens:        maxCompletionTokens,
-			UserDefined:                true,
-		})
+}
+
+// isChatModel filters the remote catalog down to models usable as chat
+// completions. The endpoint lists every kind of backend the account can reach,
+// including image generators, which it marks with a zero input limit; sending
+// one a chat request fails with code 11103 "Backend not supported".
+func isChatModel(m remoteModel) bool {
+	if m.ID == "" || m.MaxInputTokens <= 0 {
+		return false
 	}
-	return models
+	// Image/video generation backends carry no input limit and are already
+	// removed above; these prefixes catch the ones that do report a limit.
+	for _, p := range []string{"hunyuan-image", "kling-", "codewise-"} {
+		if strings.HasPrefix(m.ID, p) {
+			return false
+		}
+	}
+	return true
+}
+
+// fetchRemoteModels performs the authenticated /v3/config call.
+func fetchRemoteModels(sa *storedAuth) ([]remoteModel, error) {
+	req, err := http.NewRequest(http.MethodGet, endpointConfig, nil)
+	if err != nil {
+		return nil, err
+	}
+	backendHeaders(req, sa)
+	req.Header.Set("Accept", "application/json")
+
+	client := sharedHTTPClient()
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("config request: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		payload, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("config http %d: %s", resp.StatusCode, truncate(string(payload), 200))
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return nil, err
+	}
+	var cfg remoteConfig
+	if err := json.Unmarshal(body, &cfg); err != nil {
+		return nil, fmt.Errorf("config decode: %w", err)
+	}
+	if cfg.Code != 0 {
+		return nil, fmt.Errorf("config code %d: %s", cfg.Code, cfg.Msg)
+	}
+	if len(cfg.Data.Models) == 0 {
+		return nil, fmt.Errorf("config returned no models")
+	}
+	return cfg.Data.Models, nil
+}
+
+// toModelInfo converts a remote entry into CPA's model descriptor.
+func toModelInfo(m remoteModel) pluginapi.ModelInfo {
+	info := pluginapi.ModelInfo{
+		ID:                         m.ID,
+		Object:                     "model",
+		OwnedBy:                    providerName,
+		DisplayName:                m.Name,
+		Name:                       m.ID,
+		SupportedGenerationMethods: []string{"chat"},
+		ContextLength:              m.MaxInputTokens,
+		InputTokenLimit:            m.MaxInputTokens,
+		MaxCompletionTokens:        m.MaxOutputTokens,
+		OutputTokenLimit:           m.MaxOutputTokens,
+		UserDefined:                true,
+	}
+	if info.DisplayName == "" {
+		info.DisplayName = m.ID
+	}
+	if m.SupportsImages {
+		info.SupportedInputModalities = []string{"text", "image"}
+	}
+	if m.SupportsToolCall {
+		info.SupportedParameters = []string{"tools", "tool_choice"}
+	}
+	return info
+}
+
+func catalogFromRemote(ms []remoteModel) []pluginapi.ModelInfo {
+	out := make([]pluginapi.ModelInfo, 0, len(ms))
+	seen := make(map[string]bool, len(ms))
+	for _, m := range ms {
+		if !isChatModel(m) || seen[m.ID] {
+			continue
+		}
+		seen[m.ID] = true
+		out = append(out, toModelInfo(m))
+	}
+	return out
+}
+
+func fallbackCatalog() []pluginapi.ModelInfo {
+	return catalogFromRemote(seedModels())
+}
+
+// handleModelsForAuth answers model.for_auth: refresh the catalog from
+// /v3/config using the caller's credential, falling back to cache then seed.
+func handleModelsForAuth(raw []byte) ([]byte, error) {
+	var req pluginapi.AuthModelRequest
+	_ = json.Unmarshal(raw, &req)
+
+	models := wbModelsCached()
+
+	sa, err := parseStored(req.StorageJSON)
+	if err != nil {
+		// No usable credential yet (login still pending): serve what we have.
+		return okEnvelope(pluginapi.ModelResponse{Provider: providerName, Models: models})
+	}
+
+	catalogMu.Lock()
+	fresh := time.Since(catalogFetched) < catalogTTL && len(catalogCache) > 0
+	catalogMu.Unlock()
+	if fresh {
+		return okEnvelope(pluginapi.ModelResponse{Provider: providerName, Models: models})
+	}
+
+	remote, err := fetchRemoteModels(sa)
+	if err != nil {
+		warnf("model catalog refresh failed, serving %d cached/seed models: %v", len(models), err)
+		return okEnvelope(pluginapi.ModelResponse{Provider: providerName, Models: models})
+	}
+	discovered := catalogFromRemote(remote)
+	if len(discovered) == 0 {
+		warnf("model catalog from /v3/config was empty after filtering, keeping %d cached/seed models", len(models))
+		return okEnvelope(pluginapi.ModelResponse{Provider: providerName, Models: models})
+	}
+
+	catalogMu.Lock()
+	catalogCache = discovered
+	catalogFetched = time.Now()
+	catalogMu.Unlock()
+	return okEnvelope(pluginapi.ModelResponse{Provider: providerName, Models: discovered})
+}
+
+// wbModelsCached returns the last discovered catalog, or the seed table when
+// discovery has not succeeded yet. Never blocks on the network.
+func wbModelsCached() []pluginapi.ModelInfo {
+	catalogMu.Lock()
+	cached := catalogCache
+	catalogMu.Unlock()
+	if len(cached) > 0 {
+		return cached
+	}
+	return fallbackCatalog()
 }
 
 // -----------------------------------------------------------------------------
