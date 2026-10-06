@@ -73,27 +73,48 @@ strings workbuddy.so | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1   # glibc �
 ./build-and-deploy.sh
 ```
 
-它把整个流程串起来,约 15 秒完成:
+它把整个流程串起来,约 15 秒完成(有缓存后 1~2 秒):
 
 1. **前置检查**:docker 可用、目标容器在跑、编译镜像存在;自动探测容器架构(决定 `GOARCH`)与 glibc 版本
-2. **编译**:容器内 `go build -buildmode=c-shared`,不污染宿主机
-3. **校验**:架构、导出符号(必须 4 个)、**产物 glibc 下限 ≤ 容器 glibc**、打印 sha256
-4. **备份**:旧插件存到容器内 `/app/plugins-backup/`,默认保留最近 5 份
+2. **探测布局**:找到 CPA 工作目录,决定插件该拷到哪
+3. **编译**:容器内 `go build -buildmode=c-shared`,不污染宿主机
+4. **校验**:架构、导出符号(必须 4 个)、**产物 glibc 下限 ≤ 容器 glibc**、打印 sha256
 5. **部署**:`docker cp` + 重启容器
 6. **验证**:轮询等 `plugin registered` 日志,再查 `/v1/models` 确认模型在列
 
-备份刻意放在 `plugins/` 目录**外**,否则 CPA 会把备份的 `.so` 当成第二个插件扫描。
+### 工作目录自动探测
+
+不同打包方式的 CPA 镜像目录布局不一样:官方镜像是 `/app`,部分第三方镜像(如
+`eceasy/cli-proxy-api`)是 `/CLIProxyAPI`。脚本按顺序找 `config.yaml` + `plugins/`
+同时存在的目录:
+
+```
+/CLIProxyAPI  /app  /data  /opt/cliproxyapi
+```
+
+都不满足时退而求其次,只要有 `config.yaml` 就用。探测结果会打印出来:
+
+```
+==> 前置检查
+  ok 工作目录 /CLIProxyAPI(插件 -> /CLIProxyAPI/plugins/workbuddy.so)
+```
+
+探测不到会直接报错,此时用 `APP_DIR_OVERRIDE=/路径` 手动指定。
+
+注意有些镜像把 `plugins/` 做成 bind mount 挂到宿主机(如
+`~/.cli-proxy-api/plugins/`),插件文件实际存在宿主机上,换容器也不会丢。
 
 可用环境变量覆盖默认值:
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `CONTAINER` | `cpa` | 目标容器名 |
-| `PLUGIN_DEST` | `/app/plugins/workbuddy.so` | 容器内插件路径 |
+| `PLUGIN_REL` | `plugins/workbuddy.so` | 插件路径(相对工作目录) |
+| `APP_DIR_OVERRIDE` | 空 | 手动指定 CPA 工作目录,跳过探测 |
 | `GO_IMAGE` | `golang:1.26-bookworm` | 编译镜像(需先 `docker pull`) |
-| `BACKUP_DIR` | `/app/plugins-backup` | 容器内备份目录 |
-| `KEEP_BACKUPS` | `5` | 保留备份份数 |
 | `GOPROXY` | `https://goproxy.cn,direct` | 模块代理 |
+| `GOPATH_VOL_BASE` | `workbuddy-gopath` | Go 模块缓存 volume 名(自动加架构后缀) |
+| `GOCACHE_VOL_BASE` | `workbuddy-gocache` | Go 编译缓存 volume 名(自动加架构后缀) |
 | `CPA_URL` | `http://localhost:8317` | 验证用地址 |
 | `CPA_KEY` | 从容器 config.yaml 读 | API key |
 | `MODEL_TO_TEST` | `deepseek-v4.1-flash` | 验证时检查的模型 |
@@ -102,11 +123,19 @@ strings workbuddy.so | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1   # glibc �
 `GOARCH` 不用手填:脚本读容器 `uname -m` 自动决定,`aarch64`/`arm64` → `arm64`,
 `x86_64`/`amd64` → `amd64`。
 
-脚本结束会打印回滚命令,例如:
+Go 的模块缓存与编译缓存挂在宿主机 volume(`workbuddy-gopath-<arch>` /
+`workbuddy-gocache-<arch>`)上,跨次编译复用,不用每次重下依赖。按架构分开是为了
+避免 amd64 与 arm64 的编译缓存互相污染。想清掉重来:
 
 ```bash
-docker cp /app/plugins-backup/workbuddy.so.20260918-012939 cpa:/app/plugins/workbuddy.so
-docker restart cpa
+docker volume rm workbuddy-gopath-arm64 workbuddy-gocache-arm64
+```
+
+脚本不自动备份旧插件。要留退路,部署前自己拷一份即可(路径按上面探测结果替换):
+
+```bash
+cp ~/.cli-proxy-api/plugins/workbuddy.so ~/.cli-proxy-api/plugins/workbuddy.so.bak
+# 出问题就拷回去,再 docker restart cpa
 ```
 
 ## 使用

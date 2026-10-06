@@ -4,7 +4,7 @@
 #
 #   ./build-and-deploy.sh
 #
-# 流程:容器内编译 -> 校验产物 -> 备份旧插件 -> 拷贝 -> 重启容器 -> 验证模型列表
+# 流程:容器内编译 -> 校验产物 -> 探测容器布局 -> 拷贝 -> 重启容器 -> 验证模型列表
 #
 # [workbuddy 2026-09-18] 首次编写:封装交叉编译 + 部署流程
 #
@@ -14,14 +14,18 @@ set -euo pipefail
 # 配置(按需改这里,或临时用环境变量覆盖)
 # ---------------------------------------------------------------------------
 CONTAINER="${CONTAINER:-cpa}"
-PLUGIN_DEST="${PLUGIN_DEST:-/app/plugins/workbuddy.so}"
-BACKUP_DIR="${BACKUP_DIR:-/app/plugins-backup}"
+# 插件路径相对于 CPA 工作目录;工作目录由脚本探测(见「探测容器布局」)
+PLUGIN_REL="${PLUGIN_REL:-plugins/workbuddy.so}"
+# 手动覆盖工作目录(留空则自动探测 /CLIProxyAPI、/app 等)
+APP_DIR_OVERRIDE="${APP_DIR_OVERRIDE:-}"
 GO_IMAGE="${GO_IMAGE:-golang:1.26-bookworm}"
-KEEP_BACKUPS="${KEEP_BACKUPS:-5}"
 SKIP_VERIFY="${SKIP_VERIFY:-0}"
 CPA_URL="${CPA_URL:-http://localhost:8317}"
 CPA_KEY="${CPA_KEY:-}"
 MODEL_TO_TEST="${MODEL_TO_TEST:-deepseek-v4.1-flash}"
+# Go 缓存 volume 名(按架构加后缀;设为空字符串可退回「不缓存」)
+GOPATH_VOL_BASE="${GOPATH_VOL_BASE:-workbuddy-gopath}"
+GOCACHE_VOL_BASE="${GOCACHE_VOL_BASE:-workbuddy-gocache}"
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # 产物落到 dist/,不覆盖仓库里已有的 workbuddy.so(.dylib 等历史产物)
@@ -99,6 +103,34 @@ CONTAINER_GLIBC="$(docker exec "$CONTAINER" sh -c 'ldd --version 2>/dev/null | h
 
 ok "容器 $CONTAINER 运行中,架构 $CONTAINER_ARCH (GOARCH=$GOARCH_VAL),glibc ${CONTAINER_GLIBC:-未知}"
 
+# CPA 的镜像打包方式不统一:官方镜像用 /app,部分第三方镜像用 /CLIProxyAPI。
+# 探测工作目录(含 config.yaml 且含 plugins/ 的那个),避免换镜像后脚本失效。
+if [ -n "$APP_DIR_OVERRIDE" ]; then
+  APP_DIR="$APP_DIR_OVERRIDE"
+  docker exec "$CONTAINER" test -d "$APP_DIR" \
+    || die "APP_DIR_OVERRIDE=$APP_DIR 在容器内不存在"
+else
+  APP_DIR="$(docker exec "$CONTAINER" sh -c '
+    for d in /CLIProxyAPI /app /data /opt/cliproxyapi; do
+      if [ -f "$d/config.yaml" ] && [ -d "$d/plugins" ]; then echo "$d"; exit 0; fi
+    done
+    # 退而求其次:只要 config.yaml
+    for d in /CLIProxyAPI /app /data /opt/cliproxyapi; do
+      if [ -f "$d/config.yaml" ]; then echo "$d"; exit 0; fi
+    done
+  ' 2>/dev/null | tr -d '\r')"
+fi
+
+[ -n "$APP_DIR" ] || die "探测不到 CPA 工作目录(找 config.yaml + plugins/)。用 APP_DIR_OVERRIDE=/路径 指定"
+
+PLUGIN_DEST="$APP_DIR/$PLUGIN_REL"
+CONFIG_PATH="$APP_DIR/config.yaml"
+# plugins 目录若不存在,部署前建出来(docker cp 不会自动创建目标父目录)
+docker exec "$CONTAINER" sh -c "mkdir -p '$APP_DIR/plugins'" \
+  || die "无法创建 $APP_DIR/plugins"
+
+ok "工作目录 $APP_DIR(插件 -> $PLUGIN_DEST)"
+
 # 工作区有未提交改动时提醒(不阻止,编译的就是当前工作区代码)
 if [ -n "$(git -C "$SRC_DIR" status --porcelain 2>/dev/null)" ]; then
   warn "工作区有未提交改动,编译的是当前工作区代码(不是 HEAD)"
@@ -109,9 +141,23 @@ fi
 # ---------------------------------------------------------------------------
 log "编译中(容器 $GO_IMAGE,目标 linux/$GOARCH_VAL)"
 
+# Go 模块缓存与编译缓存挂到宿主机 volume,跨次编译复用。
+# 容器 --rm 后 /tmp 会清空,不挂出来每次都要重下依赖、全量重编。
+# 按 GOARCH 分开,避免 amd64/arm64 的编译缓存互相污染。
+GOPATH_VOL="${GOPATH_VOL_BASE}-${GOARCH_VAL}"
+GOCACHE_VOL="${GOCACHE_VOL_BASE}-${GOARCH_VAL}"
+docker volume create "$GOPATH_VOL" >/dev/null
+docker volume create "$GOCACHE_VOL" >/dev/null
+docker volume inspect "$GOPATH_VOL" >/dev/null 2>&1 \
+  || die "无法创建 volume $GOPATH_VOL(检查 docker 权限)"
+docker volume inspect "$GOCACHE_VOL" >/dev/null 2>&1 \
+  || die "无法创建 volume $GOCACHE_VOL(检查 docker 权限)"
+
 BUILD_START=$(date +%s)
 docker run --rm --platform "linux/$GOARCH_VAL" \
   -v "$SRC_DIR":/src -w /src \
+  -v "$GOPATH_VOL":/tmp/gopath \
+  -v "$GOCACHE_VOL":/tmp/gocache \
   -e CGO_ENABLED=1 -e GOOS=linux -e GOARCH="$GOARCH_VAL" \
   -e GOPATH=/tmp/gopath -e GOCACHE=/tmp/gocache \
   -e GOPROXY="${GOPROXY:-https://goproxy.cn,direct}" \
@@ -154,33 +200,15 @@ SO_SHA="$(shasum -a 256 "$OUT_SO" | awk '{print $1}')"
 ok "大小 $SO_SIZE,sha256 ${SO_SHA:0:16}…"
 
 # ---------------------------------------------------------------------------
-# 3. 备份旧插件(放在 plugins 目录外,避免被 CPA 当成第二个插件扫描)
-# ---------------------------------------------------------------------------
-log "备份旧插件"
-
-OLD_SHA="$(docker exec "$CONTAINER" sha256sum "$PLUGIN_DEST" 2>/dev/null | awk '{print $1}' || true)"
-if [ -n "$OLD_SHA" ]; then
-  if [ "$OLD_SHA" = "$SO_SHA" ]; then
-    ok "容器内插件已是同一份(sha256 相同),仍会重新拷贝以刷新 mtime"
-  fi
-  STAMP="$(date +%Y%m%d-%H%M%S)"
-  docker exec "$CONTAINER" sh -c \
-    "mkdir -p '$BACKUP_DIR' && cp '$PLUGIN_DEST' '$BACKUP_DIR/workbuddy.so.$STAMP'" \
-    || warn "备份失败,继续部署"
-  ok "备份到 $BACKUP_DIR/workbuddy.so.$STAMP"
-
-  # 只保留最近 N 份
-  docker exec "$CONTAINER" sh -c \
-    "ls -1t '$BACKUP_DIR'/workbuddy.so.* 2>/dev/null | tail -n +$((KEEP_BACKUPS + 1)) | xargs -r rm -f" \
-    || true
-else
-  warn "容器内没有 $PLUGIN_DEST,跳过备份(首次部署?)"
-fi
-
-# ---------------------------------------------------------------------------
-# 4. 拷贝并重启
+# 3. 拷贝新插件
 # ---------------------------------------------------------------------------
 log "部署到容器"
+
+# 先看容器里现有的是不是同一份(仅提示,仍会重拷以刷新 mtime)
+OLD_SHA="$(docker exec "$CONTAINER" sha256sum "$PLUGIN_DEST" 2>/dev/null | awk '{print $1}' || true)"
+if [ -n "$OLD_SHA" ] && [ "$OLD_SHA" = "$SO_SHA" ]; then
+  ok "容器内插件已是同一份(sha256 相同),仍会重新拷贝以刷新 mtime"
+fi
 
 docker cp "$OUT_SO" "$CONTAINER:$PLUGIN_DEST" || die "拷贝失败"
 ok "已拷入 $PLUGIN_DEST"
@@ -212,7 +240,7 @@ if docker logs --since 90s "$CONTAINER" 2>&1 | grep -q "model registrar workbudd
 fi
 
 # ---------------------------------------------------------------------------
-# 5. 端到端验证
+# 4. 端到端验证
 # ---------------------------------------------------------------------------
 if [ "$SKIP_VERIFY" = "1" ]; then
   warn "SKIP_VERIFY=1,跳过 API 验证"
@@ -220,9 +248,16 @@ else
   log "验证模型列表"
 
   if [ -z "$CPA_KEY" ]; then
-    # 尝试从容器内 config.yaml 读第一个 api-key
+    # 从容器内 config.yaml 读第一个 api-key。两种写法都要认:
+    #   api-keys: ["xxx"]        (内联)
+    #   api-keys:                (块列表,取下一行的 - "xxx")
+    #     - "xxx"
     CPA_KEY="$(docker exec "$CONTAINER" sh -c \
-      "grep -m1 '^api-keys:' /app/config.yaml 2>/dev/null | sed -E 's/.*\\[\"([^\"]+)\".*/\1/'" || true)"
+      "grep -A1 '^api-keys:' '$CONFIG_PATH' 2>/dev/null | grep -oE '\"[^\"]+\"' | head -1 | tr -d '\"'" || true)"
+    # 校验:真 key 是长随机串,不含冒号/空格;匹配失败时 grep 会把 'api-keys:' 原样带出来
+    case "$CPA_KEY" in
+      ""|*:*|*\ *) CPA_KEY="" ;;
+    esac
   fi
 
   if [ -z "$CPA_KEY" ]; then
@@ -249,5 +284,3 @@ fi
 # ---------------------------------------------------------------------------
 log "完成"
 printf '  插件: %s (%s, glibc>=%s)\n' "$PLUGIN_DEST" "$SO_SIZE" "${SO_GLIBC:-?}"
-printf '  回滚: docker cp %s/workbuddy.so.<时间戳> %s:%s && docker restart %s\n' \
-  "$BACKUP_DIR" "$CONTAINER" "$PLUGIN_DEST" "$CONTAINER"
