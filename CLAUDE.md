@@ -52,7 +52,8 @@ go build -buildmode=c-shared -o dist/workbuddy.so .
 | 输出路径必须用容器内相对路径 | 写宿主机绝对路径不报错，但文件落进容器临时层，随 `--rm` 消失 |
 | `docker cp` 不建父目录 | 目标 `plugins/` 不存在会直接失败，脚本先 `mkdir -p` |
 | glibc 基线 | `bookworm` 要求 glibc ≥ 2.34；更老的系统（Ubuntu 20.04, glibc 2.31）要用 `golang:1.21-bullseye` |
-| 备份目录不能放 `plugins/` 内 | CPA 会把备份的 `.so` 当第二个插件扫描（该逻辑现已删除） |
+| **API key 在 v8 挪了位置** | `api-keys` 从顶层移进 `access:` 段，锚定行首的 grep 会匹配到另一个空的顶层节，导致验证被静默跳过。详见第 10 节 |
+| 编译产物会被覆盖 | 脚本自动备份到 `dist/.backup/`（保留 5 份，`KEEP_BACKUPS` 可调） |
 
 ### 容器布局不统一 —— 脚本会自动探测
 
@@ -142,7 +143,8 @@ curl https://copilot.tencent.com/v3/config \
 1. 官方客户端自己就读这个接口 —— 桌面端 `product.json` 里的
    `ACC_PRODUCT_CONFIG_V3` / `ACC_PRODUCT_CONFIG_V2` 环境变量注入的就是同一份数据
 2. 按凭据返回，反映当前账号真实可见的模型
-3. **服务端上新模型后自动生效**，不需要改代码或重新编译
+3. **服务端上新模型后不需要改代码或重新编译**，但**必须重启 CPA 进程**才看得到 ——
+   见下面「缓存冻结」一节
 
 三个域名都可用且返回相同内容：`copilot.tencent.com` / `www.workbuddy.cn` / `www.codebuddy.cn`。
 
@@ -158,6 +160,30 @@ curl https://copilot.tencent.com/v3/config \
 - `seedModels()` — 内置兜底表（仅在完全拉不到时用）
 
 **降级链**：`/v3/config` 失败 → 上次成功结果 → `seedModels()`。
+
+### ⚠️ 缓存冻结 —— 上新模型后必须重启 CPA
+
+`handleModelsForAuth` 里的 30 分钟 TTL **只在被调用时才起作用**，而 CPA 只在
+**插件加载时调一次 `model.for_auth`**。之后：
+
+- `/v1/models` 走 `model.static`（`main.go:241`）—— 只读内存缓存，**永不联网**
+- `model.for_auth` 不再被调用 → TTL 永远不检查 → 缓存冻在进程启动那一刻的版本
+
+**实测证据（2026-10-13）**：容器 10-06 启动，缓存冻在 10-06。
+`step-5-preview` 是之后上线的，插件列表里一直没有（60→61 个模型都对不上），
+但直接打上游接口**能正常返回**（`content: "OK"`, `finish_reason: stop`）。
+`docker restart cpa` 后立刻出现，模型总数 61 → 62。
+
+**排查手法**：插件列表缺模型，而直接 curl 上游 `/v3/config` 和
+`/v2/chat/completions` 都正常 → 就是缓存冻结，重启即可，**不用重新编译**。
+
+**没法绕开重启**（都试过，全堵死）：
+
+| 尝试 | 结果 |
+|---|---|
+| `/v8/management/credentials` 触发刷新 | 401，`secret-key` 是 bcrypt hash，明文已丢失 |
+| 公开刷新路由（`/v1/models/refresh` 等） | 全 404 |
+| 只读日志确认调用 | 插件无日志输出，查不到 |
 
 ### 探测模型可用性的方法
 
@@ -297,6 +323,76 @@ CPA 的 `/v1/models` 端点**只返回 `id` / `object` / `owned_by`**，不透�
 11102）。当前实现（方案 C）不做可用性探测，所以它们会出现在列表里，调用时才报错。
 这是刻意的取舍 —— 避免启动时打 30 个探测请求。
 
+### 下游：CCR 的上下文窗口识别
+
+模型列表交给 **claude-code-router（CCR）** 后，CCR 还要自己判断每个模型支持多大的
+上下文窗口。**插件填的元数据 CCR 不读**（CPA 的 `/v1/models` 只给 `id`），两边独立。
+
+**CCR 的判定链路**（反编译 `dist/main/router-plugin.js`）：
+
+```js
+function Q(e){
+  for(r of Fl(e)) if(o=byKey.get(r))            return o   // 一级：id + aliases
+  for(r of Fl(e)) if(o=byModelKey.get(Tr(r)))   return o   // 二级：裸模型名
+  return El(e)                                             // 三级：硬编码
+}
+```
+
+- **一级 `byKey`** — 记录的 `id` 和 `aliases` 都进这个索引
+- **二级 `byModelKey`** — 裸名。同名记录 >1 条时**冲突被抹成 `undefined`**，
+  `Q()` 里 `if(i)` 判假跳过，等于永久放弃
+- **三级 `El()`** — **只对 `gpt-5.6*` 返回硬编码值（1050000/128000），其余一律 `undefined`**
+
+**⚠️ 未被识别的模型不是「默认 200k」，是「无信息」。** 下游读到 `undefined` →
+`!!undefined` → `false`，具体数值不保留。
+
+**为什么 `cpa/*` 全部落空**：CCR 的 provider 名是 `cpa`，查询 key 形如
+`cpa/step-5-preview`，但内置表里没有 `cpa` 这个 provider，一级必然落空；二级又因
+裸名冲突（`glm-5.3` 有 18 条记录、`kimi-k3` 17 条）也命中不了。
+
+**修法：改 `dist/models.json`。** 另有 `modelMetadata` 配置口子（provider 上加字段，
+见 `gp()` / `Dg()`），**已实测 CCR 不读，别走那条路**。
+
+**工具**：`~/.claude-code-router/patch-ccr-models.py`（不在本仓库，但为这个项目写的）
+
+| 表 | 用途 |
+|---|---|
+| `WANT` | 表里**已有同名宿主**时，给宿主追加 `cpa/xxx` alias。⚠️ 会连宿主数值一起继承 |
+| `NEW` | 表里**没有宿主**时新建独立记录，数值可直接填 `/v3/config` 真值。id 本身即进 `byKey` |
+
+**踩过的坑**：
+
+| 坑 | 说明 |
+|---|---|
+| 宿主数值不可信 | `kimi-k2.6` 上游 out=32000、宿主 `moonshotai/kimi-k2.6` 是 262144（**8 倍**）；`minimax-m2.5` 上游 ctx=200000、宿主 1000000（**5 倍**） |
+| 很多模型没宿主 | 31 个 workbuddy 模型里 11 个搜不到同名记录，只能走 `NEW` |
+| 表属 npm 包 | `package.json` 的 `files` 含 `dist`，**升级会被覆盖**，升级后重跑脚本 |
+| 改完必须重启 CCR | `ccr stop && ccr start`，没有热重载 |
+
+**当前覆盖状态（2026-10-13）**：62 个模型（31 workbuddy + 31 cursor）里只修了 2 个 ——
+`cpa/deepseek-v4.1-flash`（alias，借宿主值）和 `cpa/step-5-preview`（新建，上游真值
+1000000/64000）。**其余 60 个仍未识别。**
+
+**上游真值表**（`/v3/config` 的 `maxInputTokens` / `maxOutputTokens`，未识别的模型照这个填）：
+
+| 模型 | ctx | out | | 模型 | ctx | out |
+|---|---|---|---|---|---|---|
+| `deepseek-v4-pro` | 1000000 | 128000 | | `kimi-k2.6` | 256000 | 32000 |
+| `deepseek-v4-flash` | 1000000 | 50000 | | `kimi-k2.7` | 256000 | 32000 |
+| `deepseek-v4.1-flash` | 1000000 | 128000 | | `kimi-k2-thinking` | 164000 | 32000 |
+| `deepseek-v3-2-volc` | 96000 | 32000 | | `kimi-k2.5` | 164000 | 32000 |
+| `glm-5.3` | 1000000 | 64000 | | `minimax-m3` | 512000 | 64000 |
+| `glm-5.3-flash` | 1000000 | 131072 | | `minimax-m2.5` / `m2.7` | 200000 | 48000 |
+| `glm-5.2` | 1000000 | 64000 | | `hunyuan-chat` | 200000 | 8192 |
+| `glm-5.1` / `5.0` / `5.0-turbo` | 200000 | 48000 | | `hy3` / `hy3-x` | 192000 | 64000 |
+| `glm-5v-turbo` | 200000 | 64000 | | `hy4-preview` / `-x` | 960000 | 64000 |
+| `glm-4.7` | 200000 | 48000 | | `space-bunny` | 1000000 | 128000 |
+| `glm-4.6` | 168000 | 32000 | | `step-5-preview` | 1000000 | 64000 |
+| `glm-4.6v` | 128000 | 32000 | | `kimi-k2.8-preview` | 1000000 | 64000 |
+| `default` | 200000 | 24000 | | `kimi-k3-1` | 1000000 | 32000 |
+
+`cursor/*` 那 31 个上游 `/v3/config` 里没有，**拿不到权威值**，要么跳过要么自己实测。
+
 ---
 
 ## 8. Git 与协作约定
@@ -321,6 +417,10 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>
 3. **`auto` / `default` 是路由别名** —— 元数据填的是别名自身的值，不代表实际后端。
 4. **`/v3/config` 含不可用模型** —— 方案 C 不做可用性探测，`glm-4.6`/`glm-4.7` 之类会
    出现在列表里，调用时才报错。要改成启动探测的话注意会打 30 个请求。
+5. **catalog 缓存会冻结** —— 30 分钟 TTL 实际不生效（`model.for_auth` 只在插件加载时
+   被调一次），上新模型必须重启 CPA。详见第 4 节「缓存冻结」。
+6. **CCR 那边 60 个模型仍未识别** —— 只修了 `deepseek-v4.1-flash` 和 `step-5-preview`。
+   真值表见第 7 节，工具是 `~/.claude-code-router/patch-ccr-models.py`。
 
 ---
 
@@ -329,19 +429,43 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>
 改完代码后：
 
 ```bash
-./build-and-deploy.sh                    # 全流程，看 6 项是否全 ok
+./build-and-deploy.sh                        # 全流程,7 步全 ok 才算过
 docker logs --tail 30 cpa | grep -i plugin   # 确认 plugin registered
 curl -fsS http://localhost:8317/v1/models -H "Authorization: Bearer $KEY" | python3 -m json.tool
 ```
 
+步骤：前置检查 → 探测布局 → 备份产物 → 编译 → 校验 → 部署 → 验证模型列表。
+
+**注意末步有两种不同的失败信号**，别混淆：
+
+| 输出 | 含义 |
+|---|---|
+| `!! 拿不到 API key` | 脚本没解析出 key（配置格式变了？）→ 见下面的读 key 说明 |
+| `!! 请求 .../v1/models 失败` | key 有，但 CPA 没起来或还没监听 |
+
 `$KEY` 从容器配置读：
 
 ```bash
-docker exec cpa sh -c "grep -A1 '^api-keys:' /CLIProxyAPI/config.yaml | grep -oE '\"[^\"]+\"' | head -1 | tr -d '\"'"
+docker exec cpa sh -c \
+  "grep -A5 -E '^[[:space:]]*api-keys:' /CLIProxyAPI/config.yaml | grep -oE '\"[^\"]+\"' | head -1 | tr -d '\"'"
 ```
 
-> 注意 `config.yaml` 里 `api-keys` 是 YAML **块列表**格式（下一行 `- "xxx"`），不是内联
-> `["xxx"]`。用 `grep -A1` + 引号提取才抓得到（脚本早期版本在这上面栽过）。
+> ⚠️ **不要用 `grep '^api-keys:'`（锚定行首）** —— CPA v8 把 key 挪进了 `access:` 段：
+>
+> ```yaml
+> access:
+>     api-keys:                          # ← 真 key 在这（有缩进）
+>         - "85106cafe9df..."
+>
+> api-keys:                              # ← 另有一个空的顶层节
+>     openai-compatibility: []
+> ```
+>
+> 锚定行首会匹配到那个空节，提取不到东西，然后验证步骤被**静默跳过**（表现为
+> `!! 拿不到 API key`，看起来像网络问题，实际是找错了地方）。
+>
+> 同理，`api-keys` 也可能是顶层块列表或顶层内联 `["xxx"]`。所以要匹配任意缩进层级
+> 并放宽后续行数 —— 上面这条命令三种写法通吃。
 
 端到端测一个模型：
 
