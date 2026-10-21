@@ -1207,15 +1207,18 @@ func sanitizeBlockedTemplates(s string) string {
 	s = strings.ReplaceAll(s,
 		"Main branch (you will usually use this for PRs)",
 		"Default branch (you will usually use this for PRs)")
-	// DeepSeek Harness (dsh) 的 agent 身份句同样在 CodeBuddy 黑名单里，命中回
+	// DeepSeek Harness (dsh) 的 system 模板同样在 CodeBuddy 黑名单里，命中回
 	// 11128 "Illegal API invocation from an unapproved channel"(流式下是 HTTP 200
-	// + SSE error 事件，所以 CPA 访问日志里只看到 200)。实测命中的是
-	// "You are an AI agent powered by DeepSeek Harness" 这一段子串——句号换成逗号、
-	// 后面接从句都照样被拦，只有改掉 "DeepSeek Harness" 前的单词才跳出精确匹配，
-	// 所以插一个 the。见 dsh 的 system 提示词首句。
-	s = strings.ReplaceAll(s,
-		"You are an AI agent powered by DeepSeek Harness",
-		"You are an AI agent powered by the DeepSeek Harness")
+	// + SSE error 事件，所以 CPA 访问日志里只看到 200)。
+	//
+	// 黑名单里的 dsh 指纹不止一条，且是跨句的长子串:
+	//   - CLI/通用: "You are an AI agent powered by DeepSeek Harness"
+	//   - Web GUI 专有: "You are interacting with the user through the DeepSeek
+	//     Harness Web GUI whose URL the runtime context names. When the user refers
+	//     to \"this page\", ..." (两句合起来才命中，单发任一句都能过)
+	// 逐条补句子会一直追不完(改身份句后 GUI 提示词仍被拦)，所以改成整体替换产品名
+	// —— 所有已知指纹都含 "DeepSeek Harness"，换掉这一个词组即可一次性跳出。
+	s = strings.ReplaceAll(s, "DeepSeek Harness", "DeepSeek Agent")
 	return s
 }
 

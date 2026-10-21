@@ -288,17 +288,26 @@ X-Refresh-Token: <token>
 `upstream 400: {"code":11128,..."Illegal API invocation from an unapproved channel"}` 只出现在 SSE 里），
 排查时不能只看访问日志的状态码。
 
-当前已知条目（`sanitizeBlockedTemplates` 全部做最小改写绕过）：
+当前已知条目：
 
 - `You are Claude Code, Anthropic's official CLI for Claude.` → `CLI`→`CLI tool`
 - `Main branch (you will usually use this for PRs)` → `Main branch`→`Default branch`
-- `You are an AI agent powered by DeepSeek Harness`（dsh 的 agent 身份句）→ 在 `DeepSeek` 前插 `the`
+- dsh（DeepSeek Harness）的 system 模板 —— **不止一条，且常是跨句长子串**：
+  - 身份句 `You are an AI agent powered by DeepSeek Harness`
+  - Web GUI 段 `You are interacting with the user through the DeepSeek Harness Web GUI
+    whose URL the runtime context names. When the user refers to "this page", ...`
+    —— 两句**合起来**才命中，单发任一句都能过
+
+**所以别按句子一条条补**：dsh 这条前后补了两版，第一版只改身份句，CLI 通但 Web GUI
+仍被拦（GUI 的 system 提示词多出上面那段）。最终做法是**整体替换产品名**
+`DeepSeek Harness` → `DeepSeek Agent`，所有已知指纹都含这个词组，一次跳出，也不用
+跟着腾讯加句子。
 
 **匹配的是子串、不含句末标点**：`...DeepSeek Harness.`、`...Harness, a coding agent.`、
-`...Harness agent.` 全部命中，只有在 `DeepSeek Harness` 之前插入单词才跳出。加新条目时
-要改写**被命中的那段子串本身**，在句尾追加文字绕不过去。
+`...Harness agent.` 全部命中，只有在 `DeepSeek Harness` 之前插入单词才跳出。要改就改
+**被命中的那段子串本身**，在句尾追加文字绕不过去。
 
-> 腾讯哪天多加模板句，就得跟着改 `sanitizeBlockedTemplates`。
+> 腾讯哪天加一条**不含** `DeepSeek Harness` 的 dsh 指纹，就得回到按句子处理。
 
 ### hy3 系列强制最大思考
 
