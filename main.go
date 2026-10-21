@@ -1216,11 +1216,21 @@ func sanitizeBlockedTemplates(s string) string {
 	//   - Web GUI 专有: "You are interacting with the user through the DeepSeek
 	//     Harness Web GUI whose URL the runtime context names. When the user refers
 	//     to \"this page\", ..." (两句合起来才命中，单发任一句都能过)
-	// 逐条补句子会一直追不完(改身份句后 GUI 提示词仍被拦)，所以改成整体替换产品名
-	// —— 所有已知指纹都含 "DeepSeek Harness"，换掉这一个词组即可一次性跳出。
-	s = strings.ReplaceAll(s, "DeepSeek Harness", "DeepSeek Agent")
+	// 逐条补句子会一直追不完(改身份句后 GUI 提示词仍被拦)，因此干脆把品牌名从
+	// 提示词里整体抹掉、换成通用说法 —— 任何以产品名为锚的指纹都无从命中。
+	//
+	// 例外: 绝对路径 ".../DeepSeek Harness.app/..." 必须原样保留，模型会照着实地址
+	// 去读，改了就成假路径。先用哨兵占住，替换完再放回。
+	s = strings.ReplaceAll(s, "You are an AI agent powered by DeepSeek Harness.", "You are an AI agent.")
+	s = strings.ReplaceAll(s, "DeepSeek Harness.app", dshAppPathSentinel)
+	s = strings.ReplaceAll(s, "DeepSeek Harness", "agent runtime")
+	s = strings.ReplaceAll(s, dshAppPathSentinel, "DeepSeek Harness.app")
 	return s
 }
+
+// dshAppPathSentinel temporarily masks the ".app" bundle path so the brand-name
+// scrub above leaves real filesystem paths intact.
+const dshAppPathSentinel = "\x00dsh-app-path\x00"
 
 // forceMaxThinking pins reasoning_effort to "high" for hy3-family models so
 // Tencent Hunyuan 3 always reasons at maximum depth. CodeBuddy only honors

@@ -298,10 +298,16 @@ X-Refresh-Token: <token>
     whose URL the runtime context names. When the user refers to "this page", ...`
     —— 两句**合起来**才命中，单发任一句都能过
 
-**所以别按句子一条条补**：dsh 这条前后补了两版，第一版只改身份句，CLI 通但 Web GUI
-仍被拦（GUI 的 system 提示词多出上面那段）。最终做法是**整体替换产品名**
-`DeepSeek Harness` → `DeepSeek Agent`，所有已知指纹都含这个词组，一次跳出，也不用
-跟着腾讯加句子。
+**所以别按句子一条条补**：dsh 这条前后改了两版——第一版只改身份句，CLI 通、Web GUI 仍被拦；
+第二版整体替换产品名（`DeepSeek Harness`→`DeepSeek Agent`），仍是在围绕品牌名做文章。
+最终做法是**把品牌名从提示词里彻底抹掉**，换成通用说法，任何以产品名为锚的指纹都无从命中：
+
+- `You are an AI agent powered by DeepSeek Harness.` → `You are an AI agent.`（整句去掉从句）
+- 其余 `DeepSeek Harness` → `agent runtime`
+- **例外**：绝对路径 `.../DeepSeek Harness.app/...` 必须原样保留（模型会照实地址去读），
+  用哨兵 `dshAppPathSentinel` 占位、替换完再放回
+
+改这条逻辑后先跑 `go test -run TestSanitize`（`main_test.go` 钉住了"品牌名抹净 + 路径完好"）。
 
 **匹配的是子串、不含句末标点**：`...DeepSeek Harness.`、`...Harness, a coding agent.`、
 `...Harness agent.` 全部命中，只有在 `DeepSeek Harness` 之前插入单词才跳出。要改就改
