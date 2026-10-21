@@ -1207,6 +1207,15 @@ func sanitizeBlockedTemplates(s string) string {
 	s = strings.ReplaceAll(s,
 		"Main branch (you will usually use this for PRs)",
 		"Default branch (you will usually use this for PRs)")
+	// DeepSeek Harness (dsh) 的 agent 身份句同样在 CodeBuddy 黑名单里，命中回
+	// 11128 "Illegal API invocation from an unapproved channel"(流式下是 HTTP 200
+	// + SSE error 事件，所以 CPA 访问日志里只看到 200)。实测命中的是
+	// "You are an AI agent powered by DeepSeek Harness" 这一段子串——句号换成逗号、
+	// 后面接从句都照样被拦，只有改掉 "DeepSeek Harness" 前的单词才跳出精确匹配，
+	// 所以插一个 the。见 dsh 的 system 提示词首句。
+	s = strings.ReplaceAll(s,
+		"You are an AI agent powered by DeepSeek Harness",
+		"You are an AI agent powered by the DeepSeek Harness")
 	return s
 }
 

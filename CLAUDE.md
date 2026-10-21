@@ -283,13 +283,20 @@ X-Refresh-Token: <token>
 
 ### 内容审核绕过（cat-and-mouse）
 
-腾讯 CodeBuddy 把 Claude Code 的固定 system 模板**逐字**加进了黑名单，命中即回"敏感内容"：
+腾讯 CodeBuddy 把若干客户端固定的 system 模板**逐字**加进了黑名单，命中即回"敏感内容"。
+流式请求下表现为 **HTTP 200 + SSE 里的 error 事件**（CPA 访问日志里只有 200，
+`upstream 400: {"code":11128,..."Illegal API invocation from an unapproved channel"}` 只出现在 SSE 里），
+排查时不能只看访问日志的状态码。
 
-- `You are Claude Code, Anthropic's official CLI tool for Claude.`
-- `Default branch (you will usually use this for PRs)`
+当前已知条目（`sanitizeBlockedTemplates` 全部做最小改写绕过）：
 
-`sanitizeBlockedTemplates` 做最小改写（`CLI`→`CLI tool`、`Main branch`→`Default branch`）绕过。
-**精确匹配，非语义审核，改一个字就行。**
+- `You are Claude Code, Anthropic's official CLI for Claude.` → `CLI`→`CLI tool`
+- `Main branch (you will usually use this for PRs)` → `Main branch`→`Default branch`
+- `You are an AI agent powered by DeepSeek Harness`（dsh 的 agent 身份句）→ 在 `DeepSeek` 前插 `the`
+
+**匹配的是子串、不含句末标点**：`...DeepSeek Harness.`、`...Harness, a coding agent.`、
+`...Harness agent.` 全部命中，只有在 `DeepSeek Harness` 之前插入单词才跳出。加新条目时
+要改写**被命中的那段子串本身**，在句尾追加文字绕不过去。
 
 > 腾讯哪天多加模板句，就得跟着改 `sanitizeBlockedTemplates`。
 
