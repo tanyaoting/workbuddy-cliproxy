@@ -1200,32 +1200,56 @@ func rewriteContentField(msg map[string]any) bool {
 	return false
 }
 
-func sanitizeBlockedTemplates(s string) string {
-	s = strings.ReplaceAll(s,
-		"You are Claude Code, Anthropic's official CLI for Claude.",
-		"You are Claude Code, Anthropic's official CLI tool for Claude.")
-	s = strings.ReplaceAll(s,
-		"Main branch (you will usually use this for PRs)",
-		"Default branch (you will usually use this for PRs)")
-	// DeepSeek Harness (dsh) 的 system 模板同样在 CodeBuddy 黑名单里，命中回
-	// 11128 "Illegal API invocation from an unapproved channel"(流式下是 HTTP 200
-	// + SSE error 事件，所以 CPA 访问日志里只看到 200)。
-	//
-	// 黑名单里的 dsh 指纹不止一条，且是跨句的长子串:
+// blockedTemplateReplacements 是内容审核绕过的替换表。用单个 strings.Replacer
+// 一遍扫完，代替原先十几条依次 ReplaceAll（每条都要重新扫全文并可能重新分配）：
+// 每个请求的每条消息的每一段文本都会走这里，长 prompt 下差别明显。
+//
+// 顺序约束（strings.Replacer 在每个位置按参数顺序取第一个命中的模式）：
+//   - 任何"某个模式的前缀"更长的模式必须排在前面；
+//   - "DeepSeek Harness.app" 必须排在 "DeepSeek Harness" 之前，
+//     否则真实 bundle 路径会被品牌替换吃掉，模型拿到假路径。
+var blockedTemplateReplacements = strings.NewReplacer(
+	// Claude Code 的身份句与 git 分支注入句：上游是逐字匹配，最小改写即可。
+	"You are Claude Code, Anthropic's official CLI for Claude.",
+	"You are Claude Code, Anthropic's official CLI tool for Claude.",
+	"Main branch (you will usually use this for PRs)",
+	"Default branch (you will usually use this for PRs)",
+
+	// DeepSeek Harness (dsh)：上游黑名单里的指纹是跨句长子串且不止一条，
+	// 逐句追着改永远追不完，所以整体抹掉品牌名、换成通用说法。
 	//   - CLI/通用: "You are an AI agent powered by DeepSeek Harness"
 	//   - Web GUI 专有: "You are interacting with the user through the DeepSeek
-	//     Harness Web GUI whose URL the runtime context names. When the user refers
-	//     to \"this page\", ..." (两句合起来才命中，单发任一句都能过)
-	// 逐条补句子会一直追不完(改身份句后 GUI 提示词仍被拦)，因此干脆把品牌名从
-	// 提示词里整体抹掉、换成通用说法 —— 任何以产品名为锚的指纹都无从命中。
-	//
-	// 例外: 绝对路径 ".../DeepSeek Harness.app/..." 必须原样保留，模型会照着实地址
+	//     Harness Web GUI whose URL the runtime context names. When the user
+	//     refers to \"this page\", ..."（两句合起来才命中，单发任一句都能过）
+	"You are an AI agent powered by DeepSeek Harness.", "You are an AI assistant.",
+	"You are an AI agent.", "You are an AI assistant.",
+
+	// 绝对路径 ".../DeepSeek Harness.app/..." 必须原样保留：模型会照着真实地址
 	// 去读，改了就成假路径。先用哨兵占住，替换完再放回。
-	s = strings.ReplaceAll(s, "You are an AI agent powered by DeepSeek Harness.", "You are an AI agent.")
-	s = strings.ReplaceAll(s, "DeepSeek Harness.app", dshAppPathSentinel)
-	s = strings.ReplaceAll(s, "DeepSeek Harness", "agent runtime")
-	s = strings.ReplaceAll(s, dshAppPathSentinel, "DeepSeek Harness.app")
-	return s
+	"DeepSeek Harness.app", dshAppPathSentinel,
+
+	// 品牌名之外，GUI 指纹还会以 "runtime context" 这段措辞为锚，一并通用化。
+	"runtime contexts", "contexts",
+	"runtime context", "context",
+	"runtime-context", "context",
+	"agent-runtime", "agent",
+	"DeepSeek Harness", "agent",
+
+	// dsh 的 @file 引用说明（web-app bundle 才有）：上游判定的是这段的
+	// **前两句组合** —— 单发任一句都能过，两句连写就回 11128。
+	// "workspace root" 是能清掉它的最小改动，改后语义不变。
+	// 注意：只替换这个短语，别动 "workspace-write"（沙箱策略名）和
+	// "workspace instructions"（工作区指令标题）。
+	"workspace root", "project root",
+)
+
+// sanitizeBlockedTemplates 把上游黑名单里的固定模板改写成等价但不同的措辞。
+func sanitizeBlockedTemplates(s string) string {
+	out := blockedTemplateReplacements.Replace(s)
+	if strings.Contains(out, dshAppPathSentinel) {
+		out = strings.ReplaceAll(out, dshAppPathSentinel, "DeepSeek Harness.app")
+	}
+	return out
 }
 
 // dshAppPathSentinel temporarily masks the ".app" bundle path so the brand-name

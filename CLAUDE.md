@@ -315,6 +315,45 @@ X-Refresh-Token: <token>
 
 > 腾讯哪天加一条**不含** `DeepSeek Harness` 的 dsh 指纹，就得回到按句子处理。
 
+#### 不含品牌名的 dsh 指纹：@file 引用说明（2026-10-29 实测）
+
+桌面端（desktop profile，base + web-app bundle）的请求 100% 被拦，headless 正常。
+隔离出来是 `@deepseek-ai/dsh-file-reference-local` 注册的那段 `FILE_REFERENCE_PROMPT`
+（407 字符，只有 web-app bundle 启用），**与用户是否真的用了 `@` 无关**——只要 `read`
+工具存在，这段就常驻系统提示词。
+
+触发条件是**前两句的组合**，单发任一句都能过：
+
+- s1 `Tokens prefixed with @ are paths the user explicitly referenced.`
+- s2 `Relative paths resolve from the workspace root; absolute paths identify files or directories on the host.`
+- s1 + s2 连写 → `11128`；s1 + s3 不触发
+
+最小改动：`workspace root` → `project root`（实测通过，语义不变）。
+注意别做全局 `workspace` 替换——`workspace-write`（沙箱策略名）和
+`workspace instructions`（工作区指令标题）都会被误伤。
+
+顺带确认的两件事：
+
+- **判定范围只覆盖 `messages`，不扫 `tools`**：把触发句塞进工具描述里照样通过。
+  所以桌面端的 32 个工具、`present`/`schedule_*` 都不用动。
+- 桌面端实际是被**系统提示词**拦的：把 desktop 的 system 换成 headless 的即可通过，
+  反之必挂。
+
+#### 实现：单遍替换
+
+`sanitizeBlockedTemplates` 现在是一张 `strings.NewReplacer` 表 + 一次扫描，
+替代原来十几条依次 `ReplaceAll`（每条都要重扫全文）。每个请求的每段文本都会走这里，
+长 prompt 下差别明显。
+
+维护这张表的两条顺序约束：
+
+1. 任何"是某个模式前缀"的更长的模式必须排在前面；
+2. `DeepSeek Harness.app` 必须排在 `DeepSeek Harness` 之前，否则真实 bundle 路径被吃掉。
+
+另外修了两个回归：工作区里曾有一版把 Claude Code 身份句和 git 分支句的**旧值写成了新值**，
+两条规则退化成空操作（`go test -run TestSanitize` 会直接失败）。改这张表后务必跑测试，
+`main_test.go` 钉住了品牌名抹净、路径完好、幂等性、以及 @file 指纹四条契约。
+
 ### hy3 系列强制最大思考
 
 `forceMaxThinking`：对 `hy3*` 开头的模型强制 `reasoning_effort=high`，覆盖客户端设置。

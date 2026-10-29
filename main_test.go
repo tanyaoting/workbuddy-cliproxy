@@ -6,8 +6,8 @@ import (
 )
 
 // TestSanitizeBlockedTemplates pins the contract of the blocked-template
-// sanitizer: brand names that CodeBuddy blacklists get scrubbed, while real
-// filesystem paths must survive untouched.
+// sanitizer: templates CodeBuddy blacklists get rewritten without changing what
+// the model is told, while real filesystem paths and unrelated wording survive.
 func TestSanitizeBlockedTemplates(t *testing.T) {
 	const appPath = "/Applications/DeepSeek Harness.app/Contents/Resources/app.asar/dsh/"
 
@@ -17,24 +17,24 @@ func TestSanitizeBlockedTemplates(t *testing.T) {
 		want string
 	}{
 		{
-			name: "dsh 身份句整句删掉 powered by 从句",
+			name: "dsh 身份句去掉 powered by 从句",
 			in:   "You are an AI agent powered by DeepSeek Harness.\n\nYou are a coding agent.",
-			want: "You are an AI agent.\n\nYou are a coding agent.",
+			want: "You are an AI assistant.\n\nYou are a coding agent.",
 		},
 		{
-			name: "剩余品牌名换成通用说法",
+			name: "剩余品牌名换成通用说法，runtime context 一并通用化",
 			in:   "The runtime context names the DeepSeek Harness implementation checkout.",
-			want: "The runtime context names the agent runtime implementation checkout.",
+			want: "The context names the agent implementation checkout.",
 		},
 		{
 			name: "Web GUI 段同样被抹掉品牌名",
 			in:   "You are interacting with the user through the DeepSeek Harness Web GUI whose URL the runtime context names.",
-			want: "You are interacting with the user through the agent runtime Web GUI whose URL the runtime context names.",
+			want: "You are interacting with the user through the agent Web GUI whose URL the context names.",
 		},
 		{
 			name: "绝对路径原样保留",
 			in:   `Current DeepSeek Harness implementation checkout: "` + appPath + `".`,
-			want: `Current agent runtime implementation checkout: "` + appPath + `".`,
+			want: `Current agent implementation checkout: "` + appPath + `".`,
 		},
 		{
 			name: "Claude Code 身份句改写",
@@ -45,6 +45,16 @@ func TestSanitizeBlockedTemplates(t *testing.T) {
 			name: "git 分支注入改写",
 			in:   "Main branch (you will usually use this for PRs)",
 			want: "Default branch (you will usually use this for PRs)",
+		},
+		{
+			name: "@file 引用说明里的 workspace root 改写",
+			in:   "Tokens prefixed with @ are paths the user explicitly referenced. Relative paths resolve from the workspace root; absolute paths identify files or directories on the host.",
+			want: "Tokens prefixed with @ are paths the user explicitly referenced. Relative paths resolve from the project root; absolute paths identify files or directories on the host.",
+		},
+		{
+			name: "沙箱策略名 workspace-write 不受影响",
+			in:   "Current DSH file policy: workspace-write. Instructions from: AGENTS.md",
+			want: "Current DSH file policy: workspace-write. Instructions from: AGENTS.md",
 		},
 		{
 			name: "无关文本原样返回",
@@ -60,6 +70,24 @@ func TestSanitizeBlockedTemplates(t *testing.T) {
 				t.Fatalf("sanitizeBlockedTemplates()\n got: %q\nwant: %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestSanitizeIdempotent guards the rewriter used on every message part: a
+// second pass must be a no-op, or text echoed back into history would drift
+// further on each request.
+func TestSanitizeIdempotent(t *testing.T) {
+	in := strings.Join([]string{
+		"You are an AI agent powered by DeepSeek Harness.",
+		"Relative paths resolve from the workspace root; absolute paths identify files or directories on the host.",
+		`Checkout: "` + "/Applications/DeepSeek Harness.app/Contents/Resources/app.asar/dsh/" + `".`,
+		"You are Claude Code, Anthropic's official CLI for Claude.",
+	}, "\n\n")
+
+	once := sanitizeBlockedTemplates(in)
+	twice := sanitizeBlockedTemplates(once)
+	if once != twice {
+		t.Fatalf("sanitizer is not idempotent:\n once: %q\ntwice: %q", once, twice)
 	}
 }
 
@@ -93,5 +121,26 @@ func TestSanitizeLeavesNoBrandName(t *testing.T) {
 	}
 	if strings.Contains(got, dshAppPathSentinel) {
 		t.Fatalf("sentinel leaked into output: %q", got)
+	}
+}
+
+// TestSanitizeClearsFileReferenceFingerprint covers the failure found against
+// the dsh desktop surface: the @file guidance's first two sentences are
+// rejected upstream only when they appear together, and "workspace root" is the
+// smallest edit that clears it.
+func TestSanitizeClearsFileReferenceFingerprint(t *testing.T) {
+	const guidance = "Tokens prefixed with @ are paths the user explicitly referenced. " +
+		"Relative paths resolve from the workspace root; absolute paths identify files or directories on the host. " +
+		"A trailing slash marks a directory: list its contents when they matter."
+
+	got := sanitizeBlockedTemplates(guidance)
+	if strings.Contains(got, "workspace root") {
+		t.Fatalf("fingerprint phrase survived: %q", got)
+	}
+	if !strings.Contains(got, "project root") {
+		t.Fatalf("replacement missing: %q", got)
+	}
+	if !strings.Contains(got, "absolute paths identify files or directories on the host") {
+		t.Fatalf("surrounding guidance was damaged: %q", got)
 	}
 }

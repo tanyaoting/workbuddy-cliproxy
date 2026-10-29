@@ -200,6 +200,21 @@ curl http://localhost:8317/v1/chat/completions \
 
 属于 cat-and-mouse:腾讯哪天多加模板句,得跟着改 `sanitizeBlockedTemplates`。
 
+### dsh(DeepSeek Harness)模板
+
+同样逐字进黑名单,命中回 `11128 Illegal API invocation from an unapproved channel`。已知两类:
+
+- **身份句与品牌名**:`You are an AI agent powered by DeepSeek Harness.`、Web GUI 段等,
+  指纹都是跨句长子串。做法是整体抹掉品牌名、换成通用说法,任何以产品名做锚的指纹都无从命中。
+  绝对路径 `.../DeepSeek Harness.app/...` 例外,必须原样保留(模型会照真实地址读文件)。
+- **@file 引用说明**:desktop(web-app bundle)才有的 407 字符段落,
+  **前两句连写**才触发,单发任一句都能过。最小改动是 `workspace root` → `project root`。
+  这段与用户是否真的用了 `@` 无关,只要 `read` 工具存在就常驻系统提示词,
+  所以桌面端会 100% 被拦。
+
+判定范围只覆盖 `messages`,**不扫 `tools`**——工具描述里出现同样的句子不会触发,
+桌面端的工具集不需要改动。
+
 ## 思考模式
 
 hy3 系列(`hy3` / `hy3-preview` / `hy3-preview-agent`)自动开最大思考:workbuddy 转发前强制 `reasoning_effort=high`,覆盖客户端任何设置。CodeBuddy 只对 `high` 真正开深度思考(`medium` / `max` / `xhigh` 等档位它直接忽略),所以这已是 hy3 能用的最高档。思考内容走 SSE 的 `delta.reasoning_content`,客户端要支持渲染思考块才看得到。
