@@ -16,3 +16,8 @@ workbuddy.json
 *.swp
 .idea/
 .vscode/
+
+# shared skills layout: real files in .agents/skills, .claude/skills holds symlinks
+# global .gitignore_global ignores .claude/, so re-include the symlink here
+!.claude/
+!.claude/skills/
